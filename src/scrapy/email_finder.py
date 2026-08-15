@@ -1,60 +1,54 @@
-import csv
-import os
 import re
 import logging
 import threading
 
-from concurrent.futures import ThreadPoolExecutor
-from playwright.sync_api import sync_playwright, TimeoutError, Error
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from playwright.sync_api import TimeoutError, Error, sync_playwright
 from urllib.parse import urljoin
 
-from url_registry import UrlRegistry
+from scrapy.url_registry import UrlRegistry
 
 
 logger = logging.getLogger(__name__)
-
-# Create a thread-local storage object
 thread_local = threading.local()
 
 EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 PATTERN = r'/careers/?$'
 
-CSV_FILE = "scraped_emails.csv"
-
-# Initialize CSV structure
-if not os.path.exists(CSV_FILE):
-    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Target Domain", "Found Email", "Source Strategy", "Page URL"])
 
 class EmailFinder:
 
     def __init__(self, url_registry: UrlRegistry):
         self.url_registry = url_registry
-        self.max_workers = min(len(url_registry.url_list), 4)
-        print("Initializing max workers with count", min(len(url_registry.url_list), 4))
+        workers = min(len(url_registry.url_list), 4)
+        self.max_workers = workers
+        logger.info("Initializing max workers with count %s", self.max_workers)
 
 
-    def worker_initializer(self):
-        print("Initialized each thread with playwright and browser started")
-        thread_local.playwright = sync_playwright().start()
-        thread_local.browser = thread_local.playwright.chromium.launch(headless=False)
-        thread_local.context = thread_local.browser.new_context()
-        print("Initialized each thread with playwright and browser done")
+    @property
+    def max_workers(self):
+        return self._max_workers
 
+    @max_workers.setter
+    def max_workers(self, value):
+        # keep at least one worker
+        self._max_workers = value if value > 0 else 1
 
-    def find_emails(self):
+    def find_emails(self) -> list:
         """
 
         :return:
         """
-        with ThreadPoolExecutor(max_workers=self.max_workers, initializer=self.worker_initializer) as executor:
-            results = executor.map(self.scrape_site, self.url_registry.url_list)
-            logger.info("Results: %s", results)
+        results = []
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = [executor.submit(self.scrape_site, url) for url in self.url_registry.url_list]
+            logger.info("Results: %s", futures)
 
-        for mail in results:
-            print(f"Scraped data for {mail} = {mail.values()}")
-        self.cleanup_workers()
+            for future in as_completed(futures):
+                logger.info("Scraped data for %s", future.result())
+                results.append(future.result())
+
+        return results
 
     def scrape_site(self, base_url: str):
         """
@@ -63,26 +57,46 @@ class EmailFinder:
         :return:
         """
 
-        mail_list = dict()
-        print("Processing site: ", base_url)
-        page = thread_local.context.new_page()
-        career_links = self.find_career_pages(page, base_url)
-        print("All career links:", career_links)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = context.new_page()
+            mail_directory = dict()
+            try:
+                logger.info("Processing site: %s", base_url)
 
-        if len(career_links) == 0:
-            # try with suffix "careers" on base_url
-            url = urljoin(base_url, "/careers")
-            mail_links = self.find_mail_id_from_careers_page(page, url)
-            mail_list[url] = mail_links
+                # Original url already points to careers
+                if "career" in base_url:
+                    career_links = [base_url]
+                else:
+                    career_links = self.find_career_pages(page, base_url)
+                    logger.info("All career links: %s", career_links)
 
-        for link in career_links:
-            # find mail from generic site and not specific to region
-            if bool(re.search(PATTERN, link)):
-                mail_links = self.find_mail_id_from_careers_page(page, link)
-                mail_list[link] = mail_links
+                # count of career links will be 0 if not found at the given url
+                # If so try with url/careers
+                if len(career_links) == 0:
+                    # try with suffix "careers" on base_url
+                    url = urljoin(base_url, "/careers")
+                    mail_links = self.find_mail_id_from_careers_page(page, url)
+                    mail_directory[url] = mail_links
 
-        print(f"Found {len(mail_list)} mails {mail_list}")
-        return mail_list
+                for link in career_links:
+                    # find mail from generic site and not specific to region
+                    if bool(re.search(PATTERN, link)):
+                        mail_links = self.find_mail_id_from_careers_page(page, link)
+                        mail_directory[link] = mail_links
+
+                logger.info("Found %s mails %s", len(mail_directory), mail_directory)
+                return mail_directory
+            except Exception as e:
+                logger.info("Exception occurred %s", str(e))
+                return mail_directory
+            finally:
+                page.close()
+                browser.close()
+                logger.info("Browser and page closed")
 
     def find_career_pages(self, page, url: str) -> list[str]:
         # navigate to the desired site
@@ -101,9 +115,6 @@ class EmailFinder:
 
                 # 1. Locate the anchor tag containing the word "Careers"
                 career_links = page.locator('a[href*="careers"]')
-
-                # count of career links will be 0 if not found at the given url
-                # If so try with url/careers
                 career_link_count = career_links.count()
                 logger.info("Career links: %s", career_link_count)
 
@@ -148,47 +159,3 @@ class EmailFinder:
         except Exception as e:
             logger.exception("Main exception as %s", str(e))
         return list(email_set)
-
-
-    # cleanup
-    def cleanup_workers(self):
-        print("cleanup of each thread started")
-        # close browser and opened contexts
-        if hasattr(thread_local, 'context'):
-            thread_local.context.close()
-        if hasattr(thread_local, 'browser'):
-            thread_local.browser.close()
-        if hasattr(thread_local, 'playwright'):
-            thread_local.playwright.stop()
-        print("cleanup of each thread finished")
-
-
-if __name__ == "__main__":
-    target_websites = [
-        "https://example.com"
-    ]
-    registry = UrlRegistry(target_websites)
-
-    test_obj = EmailFinder(registry)
-    test_obj.find_emails()
-
-
-
-# NOT SITES WITH THEIR
-# 1. Open the site using playwright
-# 2. Find careers page from the rendered html - in header, footer or nav bar
-# 3.
-#   3.1 If found, navigate to new url, wait until loaded, search mail_id
-#         3.11 If found collect the mail_id
-#   3.2  If not found, add careers as prefix or suffix to the existing url
-#             navigate to url, wait until loaded and search mail_id
-#          3.12 If found collect mail_id
-#               else add to validation API
-
-# navigate:
-# page.goto("https://example.com")
-
-# Navigate to careers page and then find email address
-
-
-
