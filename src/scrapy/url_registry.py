@@ -1,5 +1,7 @@
 import logging
-
+import os
+import sys
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +23,9 @@ class UrlRegistry:
 
     @url_list.setter
     def url_list(self, urls : str|list):
-        logger.info("Setter called with %s", urls)
         # validate
         if isinstance(urls, str):
-            self._url_list = [urls]
+            self._url_list = urls.split(',')
         elif isinstance(urls, list):
             self._url_list = urls
         else:
@@ -39,10 +40,18 @@ class UrlRegistry:
         :return:
         """
         try:
-            with open(filename, 'r') as f:
+            file_path = Path(filename)
+            with open(file_path, 'r') as f:
                 urls = [line.strip() for line in f if line.strip()]
+                if not urls and filename == "urls.txt":
+                    logger.info("No urls found in file %s. "
+                                "Please add urls in file to find emails or specify absolute path "
+                                "of the file having urls", filename)
+                    sys.exit(0)
         except FileNotFoundError as fe:
-            logger.exception("File not found %s", fe)
+            logger.error("File %s not found at current directory %s"
+                         "Failed with exception %s", filename, os.getcwd(), fe)
+            logger.info("Add file in current directory %s or provide absolute path on command line", os.getcwd())
             raise
 
         return cls(urls)
