@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 from unittest.mock import patch, mock_open
 
 import pytest
@@ -33,7 +34,7 @@ class TestUrlRegistry:
 
         reg = UrlRegistry.read_from_file(mock_filepath)
 
-        mock_file.assert_called_with(mock_filepath, "r")
+        mock_file.assert_called_once_with(Path(mock_filepath),"r",)
         assert reg.url_list == ['https://a.com', 'https://b.com', 'https://c.com']
 
 
